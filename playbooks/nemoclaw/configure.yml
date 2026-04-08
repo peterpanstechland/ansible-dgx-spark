@@ -1,0 +1,358 @@
+---
+# NemoClaw Sandbox 配置 Playbook — Patches + Feishu + Watchdog + NPM
+#
+# 在 onboard 完成后，配置 sandbox 内部环境、部署 watchdog、优化 NPM。
+# 覆盖 docs/nemoclaw-dgx-spark.md 中的 Patch 1-8。
+#
+# 运行:
+#   # 全部配置
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/configure.yml
+#
+#   # 仅 sandbox patches
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/configure.yml --tags patches
+#
+#   # 仅 Feishu 集成
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/configure.yml \
+#     --tags feishu -e feishu_enabled=true -e feishu_app_id=cli_xxx -e feishu_app_secret=xxx
+#
+#   # 仅 watchdog
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/configure.yml --tags watchdog
+#
+#   # 仅 NPM streaming
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/configure.yml --tags npm
+
+- name: 配置 NemoClaw Sandbox + 运维组件
+  hosts: hackathon
+  become: false
+  vars_files:
+    - vars/main.yml
+
+  pre_tasks:
+    - name: 验证 sandbox 正在运行
+      ansible.builtin.shell:
+        cmd: >
+          source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+          openshell sandbox get {{ nemoclaw_sandbox_name }} --gateway {{ openshell_gateway_name }} 2>&1
+      args:
+        executable: /bin/bash
+      register: sandbox_state
+      changed_when: false
+      failed_when: "'Ready' not in sandbox_state.stdout and 'Running' not in sandbox_state.stdout"
+      tags: always
+
+  tasks:
+    # ================================================================
+    #  阶段 A: Sandbox 文件部署 (Patches 1, 4, 5, 7, 8)
+    # ================================================================
+    - name: Sandbox 文件部署
+      tags: [patches, full]
+      block:
+        # -- openclaw.json (Patch 1 + 8: trustedProxies + inference.local 模型) --
+        - name: 生成 openclaw.json 到 DGX 临时目录
+          ansible.builtin.template:
+            src: templates/openclaw.json.j2
+            dest: /tmp/ansible-openclaw.json
+            mode: '0644'
+
+        - name: 部署 openclaw.json 到 sandbox
+          ansible.builtin.shell:
+            cmd: >
+              cat /tmp/ansible-openclaw.json |
+              docker exec -i {{ openshell_cluster_container }}
+              kubectl exec -i -n openshell {{ nemoclaw_sandbox_name }} --
+              sh -c 'cat > /sandbox/.openclaw/openclaw.json &&
+              chown 998:998 /sandbox/.openclaw/openclaw.json &&
+              chmod 644 /sandbox/.openclaw/openclaw.json'
+          changed_when: true
+
+        # -- proxy-bootstrap.js (Patch 4) --
+        - name: 生成 proxy-bootstrap.js 到 DGX 临时目录
+          ansible.builtin.template:
+            src: templates/proxy-bootstrap.js.j2
+            dest: /tmp/ansible-proxy-bootstrap.js
+            mode: '0644'
+
+        - name: 部署 proxy-bootstrap.js 到 sandbox
+          ansible.builtin.shell:
+            cmd: >
+              cat /tmp/ansible-proxy-bootstrap.js |
+              docker exec -i {{ openshell_cluster_container }}
+              kubectl exec -i -n openshell {{ nemoclaw_sandbox_name }} --
+              sh -c 'cat > /sandbox/.openclaw/proxy-bootstrap.js &&
+              chown 998:998 /sandbox/.openclaw/proxy-bootstrap.js &&
+              chmod 644 /sandbox/.openclaw/proxy-bootstrap.js'
+          changed_when: true
+
+        # -- node wrapper (Patch 5) --
+        - name: 检查 node.real 是否已存在（wrapper 已部署）
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              test -f /usr/local/bin/node.real && echo EXISTS || echo MISSING
+              '
+          register: node_real_check
+          changed_when: false
+
+        - name: 备份原始 node 二进制为 node.real
+          when: "'MISSING' in node_real_check.stdout"
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              cp /usr/local/bin/node /usr/local/bin/node.real
+              '
+
+        - name: 生成 node wrapper 到 DGX 临时目录
+          ansible.builtin.template:
+            src: templates/node-wrapper.sh.j2
+            dest: /tmp/ansible-node-wrapper.sh
+            mode: '0755'
+
+        - name: 部署 node wrapper 到 sandbox（先 rm 避免 Text file busy）
+          ansible.builtin.shell:
+            cmd: >
+              cat /tmp/ansible-node-wrapper.sh |
+              docker exec -i {{ openshell_cluster_container }}
+              kubectl exec -i -n openshell {{ nemoclaw_sandbox_name }} --
+              sh -c 'rm -f /usr/local/bin/node; cat > /usr/local/bin/node && chmod +x /usr/local/bin/node'
+          changed_when: true
+
+        # -- 权限修复 (Patch 7) --
+        - name: 修复 sandbox 文件权限
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              chown -R 998:998 /sandbox/.openclaw/ /sandbox/.openclaw-data/ 2>/dev/null;
+              chmod 700 /sandbox/.openclaw;
+              chmod 644 /sandbox/.openclaw/openclaw.json;
+              mkdir -p /sandbox/.openclaw-data/credentials;
+              chown 998:998 /sandbox/.openclaw-data/credentials;
+              chmod 700 /sandbox/.openclaw-data/credentials;
+              true
+              '
+          changed_when: false
+
+        - name: 清理 DGX 临时文件
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /tmp/ansible-openclaw.json
+            - /tmp/ansible-proxy-bootstrap.js
+            - /tmp/ansible-node-wrapper.sh
+
+    # ================================================================
+    #  阶段 B: Feishu 网络策略 (Patch 6)
+    # ================================================================
+    - name: Feishu 网络策略
+      tags: [feishu, full]
+      when: feishu_enabled | default(false) | bool
+      block:
+        - name: 验证 Feishu 凭据已提供
+          ansible.builtin.assert:
+            that:
+              - feishu_app_id | length > 0
+              - feishu_app_secret | length > 0
+            fail_msg: "请通过 -e feishu_app_id=xxx -e feishu_app_secret=xxx 传入飞书凭据"
+
+        - name: 在 sandbox 内运行 openclaw doctor --fix
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              su -s /bin/sh sandbox -c "
+              export HOME=/sandbox;
+              openclaw doctor --fix 2>&1 || true
+              "
+              '
+          changed_when: false
+
+        - name: 修复 doctor 变更后的 openclaw.json 权限
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              chown 998:998 /sandbox/.openclaw/openclaw.json 2>/dev/null || true;
+              chmod 600 /sandbox/.openclaw/openclaw.json 2>/dev/null || true
+              '
+          changed_when: false
+
+    # ================================================================
+    #  阶段 C: Gateway 重启与验证 (Patch 2, 3)
+    # ================================================================
+    - name: Gateway 重启与验证
+      tags: [patches, full]
+      block:
+        - name: Kill 现有 gateway 进程
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              for p in /proc/[0-9]*; do
+                pid=$(basename $p);
+                cmd=$(cat $p/cmdline 2>/dev/null | tr "\0" " ");
+                if echo "$cmd" | grep -qi "openclaw"; then
+                  kill $pid 2>/dev/null && echo "Killed $pid";
+                fi;
+              done;
+              rm -rf /tmp/jiti 2>/dev/null;
+              true
+              ' || true
+          changed_when: true
+          failed_when: false
+
+        - name: 等待旧进程退出
+          ansible.builtin.pause:
+            seconds: 3
+
+        - name: 启动新 gateway（通过 kubectl exec, 以 sandbox 用户运行）
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              su -s /bin/sh sandbox -c "
+              export HOME=/sandbox;
+              cd /sandbox/.openclaw;
+              nohup openclaw gateway run --bind lan > /tmp/gateway.log 2>&1 &
+              echo Gateway_PID=\$!
+              "
+              '
+          changed_when: true
+
+        - name: 等待 gateway 启动
+          ansible.builtin.pause:
+            seconds: 10
+
+        - name: 验证 gateway 正在监听
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              ss -tlnp 2>/dev/null | grep -q ":{{ nemoclaw_ui_port }} "
+              '
+          register: gw_listen_check
+          retries: 6
+          delay: 5
+          until: gw_listen_check.rc == 0
+
+        - name: 批准设备配对 (Patch 2)
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              export HOME=/sandbox;
+              openclaw devices approve --latest 2>&1 || true
+              '
+          changed_when: false
+          failed_when: false
+
+        - name: 验证 Ollama 直连
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              curl -s --max-time 30 http://{{ docker_bridge_gateway }}:11434/v1/chat/completions
+              -H "Content-Type: application/json"
+              -d "{\"model\":\"{{ ollama_fast_model }}\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"max_tokens\":5}"
+              ' 2>&1
+          register: ollama_test
+          changed_when: false
+          failed_when: false
+
+        - name: 验证 vLLM 直连
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c '
+              curl -s --max-time 30 http://{{ docker_bridge_gateway }}:{{ vllm_port }}/v1/chat/completions
+              -H "Content-Type: application/json"
+              -d "{\"model\":\"{{ vllm_served_model_name }}\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"max_tokens\":5}"
+              ' 2>&1
+          register: vllm_test
+          changed_when: false
+          failed_when: false
+
+        - name: 显示推理测试结果
+          ansible.builtin.debug:
+            msg: |
+              Ollama: {{ ollama_test.stdout[:200] | default('无输出') }}
+              vLLM:   {{ vllm_test.stdout[:200] | default('无输出') }}
+
+        - name: 验证 UI 可达（需 socat/NodePort，由 watchdog 维护）
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ nemoclaw_ui_port }}/"
+            method: GET
+            status_code: 200
+            timeout: 15
+          register: ui_check
+          retries: 3
+          delay: 10
+          failed_when: false
+
+        - name: 提取 gateway auth token
+          ansible.builtin.shell:
+            cmd: >
+              {{ kubectl_exec_prefix }} sh -c
+              'python3 -c "import json;d=json.load(open(\"/sandbox/.openclaw/openclaw.json\"));print(d.get(\"gateway\",{}).get(\"auth\",{}).get(\"token\",d.get(\"gateway\",{}).get(\"token\",\"\")))"'
+          register: gateway_token
+          changed_when: false
+          failed_when: false
+
+        - name: 显示 Web UI 地址
+          ansible.builtin.debug:
+            msg: |
+              ═══════════════════════════════════════════════════════
+              NemoClaw 配置完成!
+              ═══════════════════════════════════════════════════════
+              Web UI: {{ nemoclaw_chat_ui_url }}/?token={{ gateway_token.stdout | trim }}
+              ═══════════════════════════════════════════════════════
+
+    # ================================================================
+    #  阶段 D: Watchdog 部署
+    # ================================================================
+    - name: Watchdog 部署
+      tags: [watchdog, full]
+      become: true
+      block:
+        - name: 部署 watchdog 脚本
+          ansible.builtin.template:
+            src: templates/nemoclaw-watchdog.sh.j2
+            dest: "{{ watchdog_script_path }}"
+            mode: '0755'
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+
+        - name: 部署 watchdog sudoers 配置
+          ansible.builtin.copy:
+            content: |
+              # Managed by Ansible — NemoClaw watchdog 免密 sudo
+              {{ ansible_user }} ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/iptables-save, /usr/sbin/sysctl
+            dest: /etc/sudoers.d/nemoclaw-watchdog
+            mode: '0440'
+            validate: visudo -cf %s
+
+        - name: 配置 watchdog cron
+          ansible.builtin.cron:
+            name: "nemoclaw-watchdog"
+            minute: "*/5"
+            job: "{{ watchdog_script_path }}"
+            user: "{{ ansible_user }}"
+
+    # ================================================================
+    #  阶段 E: NPM 流式优化（Ubuntu 侧）
+    # ================================================================
+    - name: NPM 流式优化
+      tags: [npm, full]
+      block:
+        - name: 部署 NPM streaming 配置到 Ubuntu
+          ansible.builtin.shell:
+            cmd: >
+              sshpass -p '{{ ansible_ssh_pass }}'
+              ssh -o StrictHostKeyChecking=no {{ npm_home_server_ip }}
+              "docker exec nginx-proxy-manager sh -c '
+              mkdir -p /data/nginx/custom &&
+              cat > /data/nginx/custom/server_proxy.conf << NGINXEOF
+              proxy_buffering off;
+              proxy_cache off;
+              proxy_request_buffering off;
+              add_header X-Accel-Buffering no;
+              proxy_buffer_size 16k;
+              proxy_buffers 4 16k;
+              NGINXEOF
+              nginx -t && nginx -s reload
+              '"
+          args:
+            executable: /bin/bash
+          changed_when: true
+          failed_when: false

@@ -1,0 +1,85 @@
+---
+# NemoClaw 快速修复 Playbook
+#
+# 当 NemoClaw 沙箱崩溃时，一键删除 + 重新 onboard
+#
+# 运行:
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/repair.yml \
+#     -e nvidia_api_key=nvapi-xxx
+
+- name: 修复 NemoClaw 沙箱
+  hosts: hackathon
+  become: false
+  vars_files:
+    - vars/main.yml
+
+  pre_tasks:
+    - name: 验证 NVIDIA API Key 已提供
+      ansible.builtin.assert:
+        that:
+          - nvidia_api_key | length > 0
+        fail_msg: "请通过 -e nvidia_api_key=nvapi-xxx 传入 NVIDIA API Key"
+
+  tasks:
+    - name: 停止 port forward
+      ansible.builtin.shell:
+        cmd: >
+          source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+          openshell forward stop {{ nemoclaw_ui_port }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: 删除现有沙箱
+      ansible.builtin.shell:
+        cmd: >
+          source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+          openshell sandbox delete {{ nemoclaw_sandbox_name }} 2>&1
+      args:
+        executable: /bin/bash
+      register: delete_result
+      changed_when: "'Deleted' in delete_result.stdout"
+      failed_when: false
+
+    - name: 等待清理完成
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: 重新 onboard NemoClaw
+      ansible.builtin.shell:
+        cmd: >
+          source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+          export NVIDIA_API_KEY='{{ nvidia_api_key }}' &&
+          export NEMOCLAW_PROVIDER={{ nemoclaw_provider }} &&
+          export NEMOCLAW_SANDBOX_NAME={{ nemoclaw_sandbox_name }} &&
+          export CHAT_UI_URL={{ nemoclaw_chat_ui_url }} &&
+          nemoclaw onboard --non-interactive 2>&1
+      args:
+        executable: /bin/bash
+      register: onboard_result
+      timeout: 300
+
+    - name: 验证 UI 可达
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ nemoclaw_ui_port }}/"
+        method: GET
+        status_code: 200
+        timeout: 15
+      register: health_check
+      retries: 5
+      delay: 10
+
+    - name: 提取 token URL
+      ansible.builtin.set_fact:
+        nemoclaw_token_url: "{{ onboard_result.stdout | regex_search('https://nemoclaw\\.peafamily\\.online/#token=[a-f0-9]+') }}"
+      when: "'token=' in onboard_result.stdout"
+
+    - name: 修复完成
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          NemoClaw 修复成功!
+          ═══════════════════════════════════════════════════════
+          状态:  HTTP {{ health_check.status }}
+          URL:   {{ nemoclaw_token_url | default('见 onboard 输出') }}
+          ═══════════════════════════════════════════════════════

@@ -1,0 +1,20 @@
+---
+# 全局变量
+
+timezone: Asia/Shanghai
+locale: en_US.UTF-8
+apt_cache_valid_time: 3600
+
+common_packages:
+  - vim
+  - htop
+  - curl
+  - wget
+  - git
+  - tmux
+  - net-tools
+
+# Docker 镜像加速（国内用户可配置）
+docker_registry_mirrors:
+  - https://docker.1ms.run
+  - https://docker.linkos.org

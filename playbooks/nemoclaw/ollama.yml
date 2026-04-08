@@ -1,0 +1,229 @@
+---
+# Ollama + OpenShell Inference 路由配置
+#
+# 在 DGX Spark 上安装/配置 Ollama，创建 OpenShell inference provider，
+# 将 inference.local 路由到本地 Ollama 模型。
+#
+# 运行:
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/ollama.yml
+#
+#   # 仅模型管理（跳过安装/配置）
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/ollama.yml --tags model
+#
+#   # 仅 inference 路由
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/ollama.yml --tags inference
+
+- name: 配置 Ollama + OpenShell Inference 路由
+  hosts: hackathon
+  become: true
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    # ================================================================
+    #  阶段 A: Ollama 安装与配置
+    # ================================================================
+    - name: Ollama 安装与配置
+      tags: [ollama, full]
+      block:
+        - name: 检查 Ollama 是否已安装
+          ansible.builtin.command: ollama --version
+          register: ollama_check
+          changed_when: false
+          failed_when: false
+
+        - name: 安装 Ollama（snap）
+          when: ollama_check.rc != 0
+          community.general.snap:
+            name: ollama
+            state: present
+
+        - name: 创建 Ollama systemd override 目录
+          ansible.builtin.file:
+            path: /etc/systemd/system/snap.ollama.listener.service.d
+            state: directory
+            mode: '0755'
+
+        - name: 部署 Ollama OLLAMA_HOST override
+          ansible.builtin.template:
+            src: templates/ollama-host-override.conf.j2
+            dest: /etc/systemd/system/snap.ollama.listener.service.d/override.conf
+            mode: '0644'
+          notify: 重启 Ollama
+
+        - name: 部署 Ollama KEEP_ALIVE override
+          ansible.builtin.template:
+            src: templates/ollama-keepalive.conf.j2
+            dest: /etc/systemd/system/snap.ollama.listener.service.d/keep-alive.conf
+            mode: '0644'
+          notify: 重启 Ollama
+
+        - name: Flush handlers 确保 Ollama 配置生效
+          ansible.builtin.meta: flush_handlers
+
+        - name: 等待 Ollama 就绪
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:11434/api/tags"
+            method: GET
+            status_code: 200
+            timeout: 10
+          register: ollama_ready
+          retries: 6
+          delay: 5
+          until: ollama_ready.status == 200
+
+        - name: 验证 Ollama 监听所有接口
+          ansible.builtin.shell:
+            cmd: ss -tlnp | grep ':11434 '
+          register: ollama_listen
+          changed_when: false
+          failed_when: "'*:11434' not in ollama_listen.stdout and '0.0.0.0:11434' not in ollama_listen.stdout"
+
+    # ================================================================
+    #  阶段 B: 模型管理
+    # ================================================================
+    - name: Ollama 模型管理
+      tags: [model, full]
+      block:
+        - name: 检查基础模型是否已拉取
+          ansible.builtin.shell:
+            cmd: "ollama list 2>/dev/null | grep -q '{{ ollama_base_model }}'"
+          register: base_model_check
+          changed_when: false
+          failed_when: false
+
+        - name: 拉取基础模型
+          when: base_model_check.rc != 0
+          ansible.builtin.command:
+            cmd: "ollama pull {{ ollama_base_model }}"
+          timeout: 1800
+
+        - name: 检查 fast 变体是否已存在
+          ansible.builtin.shell:
+            cmd: "ollama list 2>/dev/null | grep -q '{{ ollama_fast_model }}'"
+          register: fast_model_check
+          changed_when: false
+          failed_when: false
+
+        - name: 创建 fast 变体（think:off）
+          when: fast_model_check.rc != 0
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:11434/api/create"
+            method: POST
+            body_format: json
+            body:
+              model: "{{ ollama_fast_model }}"
+              from: "{{ ollama_base_model }}"
+              params:
+                num_ctx: "{{ ollama_num_ctx }}"
+                think: "off"
+            timeout: 120
+            status_code: 200
+
+        - name: 预加载模型到 GPU（keep_alive=-1）
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:11434/api/generate"
+            method: POST
+            body_format: json
+            body:
+              model: "{{ ollama_fast_model }}"
+              prompt: ""
+              keep_alive: -1
+              options:
+                num_ctx: "{{ ollama_num_ctx }}"
+            timeout: 120
+            status_code: 200
+
+        - name: 验证模型已加载
+          ansible.builtin.shell:
+            cmd: "ollama ps | grep '{{ ollama_fast_model }}'"
+          register: model_loaded
+          changed_when: false
+          retries: 3
+          delay: 5
+
+    # ================================================================
+    #  阶段 C: OpenShell Inference 路由
+    # ================================================================
+    - name: 获取实际用户 HOME 路径
+      tags: [inference, full]
+      become: false
+      ansible.builtin.shell:
+        cmd: "echo $HOME"
+      args:
+        executable: /bin/bash
+      register: user_home
+      changed_when: false
+
+    - name: OpenShell Inference 路由配置
+      tags: [inference, full]
+      become: false
+      vars:
+        nvm_sh: "{{ user_home.stdout }}/.nvm/nvm.sh"
+      block:
+        - name: 获取本机 IP
+          ansible.builtin.shell:
+            cmd: hostname -I | awk '{print $1}'
+          register: machine_ip
+          changed_when: false
+
+        - name: 检查 provider 是否已存在
+          ansible.builtin.shell:
+            cmd: >
+              source {{ nvm_sh }} &&
+              openshell provider list --gateway {{ openshell_gateway_name }} 2>&1
+          args:
+            executable: /bin/bash
+          register: provider_list
+          changed_when: false
+
+        - name: 创建 local-ollama provider
+          when: "ollama_provider_name not in provider_list.stdout"
+          ansible.builtin.shell:
+            cmd: >
+              source {{ nvm_sh }} &&
+              openshell provider create --gateway {{ openshell_gateway_name }}
+              --name {{ ollama_provider_name }}
+              --type openai
+              --credential OPENAI_API_KEY=not-needed
+              --config OPENAI_BASE_URL=http://{{ machine_ip.stdout }}:11434/v1
+          args:
+            executable: /bin/bash
+          register: provider_create
+          changed_when: "'Created' in provider_create.stdout"
+
+        - name: 设置 inference 路由到 local-ollama
+          ansible.builtin.shell:
+            cmd: >
+              source {{ nvm_sh }} &&
+              openshell inference set --gateway {{ openshell_gateway_name }}
+              --provider {{ ollama_provider_name }}
+              --model {{ ollama_fast_model }}
+          args:
+            executable: /bin/bash
+          register: inference_set
+
+        - name: 验证 inference 路由
+          ansible.builtin.shell:
+            cmd: >
+              source {{ nvm_sh }} &&
+              openshell inference get --gateway {{ openshell_gateway_name }} 2>&1
+          args:
+            executable: /bin/bash
+          register: inference_check
+          changed_when: false
+          failed_when: "ollama_provider_name not in inference_check.stdout"
+
+        - name: 显示 inference 配置
+          ansible.builtin.debug:
+            msg: |
+              Inference 路由已配置:
+                Provider: {{ ollama_provider_name }}
+                Model:    {{ ollama_fast_model }}
+                Machine:  {{ machine_ip.stdout }}
+
+  handlers:
+    - name: 重启 Ollama
+      ansible.builtin.shell:
+        cmd: systemctl daemon-reload && snap restart ollama
+      listen: 重启 Ollama

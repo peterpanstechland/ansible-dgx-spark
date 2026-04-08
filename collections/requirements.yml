@@ -1,0 +1,24 @@
+---
+# Ansible Collections 依赖
+# 安装: ansible-galaxy collection install -r collections/requirements.yml
+
+collections:
+  # AWX/Automation Controller 管理
+  - name: awx.awx
+    version: ">=23.0.0"
+
+  # Docker 管理
+  - name: community.docker
+    version: ">=3.0.0"
+
+  # 通用工具
+  - name: community.general
+    version: ">=8.0.0"
+
+  # 加密工具
+  - name: community.crypto
+    version: ">=2.0.0"
+
+  # POSIX 系统管理
+  - name: ansible.posix
+    version: ">=1.5.0"

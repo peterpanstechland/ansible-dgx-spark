@@ -1,0 +1,155 @@
+{# Managed by Ansible — OpenClaw configuration for NemoClaw sandbox #}
+{
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://{{ docker_bridge_gateway }}:11434/v1",
+        "apiKey": "unused",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "{{ ollama_fast_model }}",
+            "name": "ollama/{{ ollama_fast_model }}",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": {{ ollama_num_ctx }},
+            "maxTokens": 8192,
+            "api": "openai-completions"
+          },
+          {
+            "id": "{{ ollama_base_model }}",
+            "name": "ollama/{{ ollama_base_model }}",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 131072,
+            "maxTokens": 8192,
+            "api": "openai-completions"
+          }
+        ]
+      },
+      "vllm": {
+        "baseUrl": "http://{{ docker_bridge_gateway }}:{{ vllm_port }}/v1",
+        "apiKey": "unused",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "{{ vllm_served_model_name }}",
+            "name": "vllm/{{ vllm_served_model_name }}",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": {{ vllm_context_window }},
+            "maxTokens": {{ vllm_max_tokens }},
+            "api": "openai-completions"
+          }
+        ]
+      },
+{% if nvidia_api_key | default('') | length > 0 %}
+      "nim": {
+        "baseUrl": "https://integrate.api.nvidia.com/v1",
+        "apiKey": "{{ nvidia_api_key }}",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "nvidia/nemotron-3-super-120b-a12b",
+            "name": "nvidia/nemotron-3-super-120b-a12b",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 131072,
+            "maxTokens": 8192,
+            "api": "openai-completions"
+          }
+        ]
+      }
+{% endif %}
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+{% if nvidia_api_key | default('') | length > 0 %}
+        "primary": "nim/nvidia/nemotron-3-super-120b-a12b",
+        "fallbacks": [
+          "ollama/{{ ollama_fast_model }}",
+          "ollama/{{ ollama_base_model }}",
+          "vllm/{{ vllm_served_model_name }}"
+        ]
+{% else %}
+        "primary": "ollama/{{ ollama_fast_model }}",
+        "fallbacks": [
+          "ollama/{{ ollama_base_model }}",
+          "vllm/{{ vllm_served_model_name }}"
+        ]
+{% endif %}
+      },
+      "imageModel": "vllm/{{ vllm_served_model_name }}",
+      "models": {
+        "ollama/{{ ollama_fast_model }}": { "alias": "Ollama 120B Fast" },
+        "ollama/{{ ollama_base_model }}": { "alias": "Ollama 120B" },
+        "vllm/{{ vllm_served_model_name }}": { "alias": "vLLM Gemma 4" }
+{% if nvidia_api_key | default('') | length > 0 %}
+        ,"nim/nvidia/nemotron-3-super-120b-a12b": { "alias": "Nemotron 120B" }
+{% endif %}
+      }
+    },
+    "list": [
+{% if nvidia_api_key | default('') | length > 0 %}
+      { "id": "main", "model": "nim/nvidia/nemotron-3-super-120b-a12b" }
+{% else %}
+      { "id": "main", "model": "ollama/{{ ollama_fast_model }}" }
+{% endif %}
+{% if nemoclaw_travel_app.enabled | default(false) | bool %}
+{% if nvidia_api_key | default('') | length > 0 %}
+      ,{ "id": "travel", "model": "nim/nvidia/nemotron-3-super-120b-a12b" }
+{% else %}
+      ,{ "id": "travel", "model": "ollama/{{ ollama_fast_model }}" }
+{% endif %}
+{% endif %}
+    ]
+  },
+{% if feishu_enabled | default(false) %}
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "accounts": {
+        "{{ feishu_account_id | default('main') }}": {
+          "appId": "{{ feishu_app_id }}",
+          "appSecret": "{{ feishu_app_secret }}"
+        }
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "{{ feishu_binding_agent_id | default('main') }}",
+      "match": { "channel": "feishu", "accountId": "{{ feishu_account_id | default('main') }}" }
+    }
+  ],
+  "plugins": {
+    "entries": {
+      "feishu": { "enabled": true }
+    }
+  },
+{% else %}
+  "channels": {},
+  "bindings": [],
+{% endif %}
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "{{ nemoclaw_gateway_token }}"
+    },
+    "controlUi": {
+      "allowedOrigins": {{ gateway_allowed_origins | to_json }},
+      "dangerouslyDisableDeviceAuth": true
+    },
+    "trustedProxies": {{ gateway_trusted_proxies | to_json }}
+  }
+}

@@ -1,0 +1,75 @@
+#!/bin/bash
+# Managed by Ansible — NemoClaw watchdog (cron every 5 min)
+KUBECTL="docker exec {{ openshell_cluster_container }} kubectl"
+LOG_FILE="{{ watchdog_log_path }}"
+CONTAINER_IP="{{ watchdog_container_ip }}"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"; }
+
+# 1. K8s NodePort service
+SVC_EXISTS=$($KUBECTL get svc nemoclaw-ui -n openshell --no-headers 2>/dev/null | wc -l)
+if [ "$SVC_EXISTS" -eq 0 ]; then
+  log "Creating nemoclaw-ui NodePort service..."
+  echo 'apiVersion: v1
+kind: Service
+metadata:
+  name: nemoclaw-ui
+  namespace: openshell
+spec:
+  ports:
+  - port: {{ nemoclaw_ui_port }}
+    protocol: TCP
+    targetPort: {{ nemoclaw_ui_port }}
+    nodePort: {{ watchdog_nodeport }}
+  selector:
+    agents.x-k8s.io/sandbox-name-hash: b1c746e6
+  type: NodePort' | docker exec -i {{ openshell_cluster_container }} kubectl apply -f - 2>&1 | while read line; do log "  $line"; done
+fi
+
+# 2. socat port forward (DGX host → container NodePort)
+if ! ss -tlnp 2>/dev/null | grep -q ':{{ nemoclaw_ui_port }} '; then
+  log "Starting socat {{ nemoclaw_ui_port }} → $CONTAINER_IP:{{ watchdog_nodeport }}"
+  nohup socat TCP-LISTEN:{{ nemoclaw_ui_port }},bind=0.0.0.0,reuseaddr,fork TCP:$CONTAINER_IP:{{ watchdog_nodeport }} > /tmp/socat-nemoclaw.log 2>&1 &
+fi
+
+# 3. iptables DNAT from wg0 → container
+if ! sudo iptables -t nat -C PREROUTING -i {{ wg_interface }} -p tcp --dport {{ nemoclaw_ui_port }} -j DNAT --to-destination $CONTAINER_IP:{{ watchdog_nodeport }} 2>/dev/null; then
+  log "Adding DNAT {{ wg_interface }}:{{ nemoclaw_ui_port }} → $CONTAINER_IP:{{ watchdog_nodeport }}"
+  sudo iptables -t nat -D PREROUTING -i {{ wg_interface }} -p tcp --dport {{ nemoclaw_ui_port }} -j DNAT --to-destination 127.0.0.1:{{ nemoclaw_ui_port }} 2>/dev/null
+  sudo iptables -t nat -A PREROUTING -i {{ wg_interface }} -p tcp --dport {{ nemoclaw_ui_port }} -j DNAT --to-destination $CONTAINER_IP:{{ watchdog_nodeport }}
+  sudo iptables -I FORWARD -i {{ wg_interface }} -d $CONTAINER_IP -p tcp --dport {{ watchdog_nodeport }} -j ACCEPT 2>/dev/null
+  sudo iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -d $CONTAINER_IP -p tcp --dport {{ watchdog_nodeport }} -j MASQUERADE 2>/dev/null || \
+    sudo iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -d $CONTAINER_IP -p tcp --dport {{ watchdog_nodeport }} -j MASQUERADE
+fi
+
+# 4. OpenClaw gateway inside sandbox
+GW_LISTENING=$($KUBECTL exec {{ nemoclaw_sandbox_name }} -n openshell -- ss -tlnp 2>/dev/null | grep -c ':{{ nemoclaw_ui_port }} ')
+if [ "$GW_LISTENING" -eq 0 ]; then
+  log "ALERT: openclaw gateway not running, starting..."
+  $KUBECTL exec {{ nemoclaw_sandbox_name }} -n openshell -- sh -c '
+    export HOME=/sandbox
+    export NODE_EXTRA_CA_CERTS=/etc/openshell-tls/ca-bundle.pem
+    export NODE_OPTIONS="--require /sandbox/.openclaw/proxy-bootstrap.js"
+    nohup openclaw gateway run --bind lan --port {{ nemoclaw_ui_port }} > /sandbox/.openclaw-data/gateway.log 2>&1 &
+  ' 2>/dev/null
+  sleep 5
+  GW_CHECK=$($KUBECTL exec {{ nemoclaw_sandbox_name }} -n openshell -- ss -tlnp 2>/dev/null | grep -c ':{{ nemoclaw_ui_port }} ')
+  if [ "$GW_CHECK" -gt 0 ]; then
+    log "Gateway restarted successfully"
+  else
+    log "ERROR: Gateway failed to start"
+  fi
+fi
+
+# 5. Database lock monitoring
+ERRORS=$($KUBECTL logs openshell-0 -n openshell --since=5m 2>/dev/null | grep -c 'database is locked')
+if [ "$ERRORS" -gt 10 ]; then
+  log "WARN: $ERRORS database lock errors in 5min"
+fi
+
+# 6. Health check
+HTTP_CODE=$(curl -s --connect-timeout 5 -o /dev/null -w '%{http_code}' --noproxy '*' http://127.0.0.1:{{ nemoclaw_ui_port }}/ 2>/dev/null)
+log "Health: HTTP $HTTP_CODE (gw_listen=$GW_LISTENING, svc=$SVC_EXISTS)"
+
+# Log rotation
+tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"

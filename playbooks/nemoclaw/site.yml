@@ -1,0 +1,39 @@
+---
+# NemoClaw 完整部署 — 一键编排
+#
+# 按顺序执行:
+#   1. deploy.yml    — WireGuard + Docker + Node/NemoClaw CLI + Onboard
+#   2. ollama.yml    — Ollama 安装 + 模型 + OpenShell inference 路由
+#   3. travel.yml    — 旅行助手（云希）Travel App + Skill + Workspace
+#   4. configure.yml — Sandbox patches + Feishu + Watchdog + NPM
+#
+# 运行:
+#   # 全新部署
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/site.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     -e wg_dgx_private_key=xxx
+#
+#   # 带飞书集成
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/site.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     -e wg_dgx_private_key=xxx \
+#     -e feishu_enabled=true \
+#     -e feishu_app_id=cli_xxx \
+#     -e feishu_app_secret=xxx
+#
+#   # 跳过 WireGuard（已配置）
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/site.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     --skip-tags wireguard
+
+- name: "NemoClaw 完整部署 [1/4] 基础设施 + Onboard"
+  ansible.builtin.import_playbook: deploy.yml
+
+- name: "NemoClaw 完整部署 [2/4] Ollama + Inference"
+  ansible.builtin.import_playbook: ollama.yml
+
+- name: "NemoClaw 完整部署 [3/4] 旅行助手（云希）"
+  ansible.builtin.import_playbook: travel.yml
+
+- name: "NemoClaw 完整部署 [4/4] Sandbox 配置 + 运维"
+  ansible.builtin.import_playbook: configure.yml

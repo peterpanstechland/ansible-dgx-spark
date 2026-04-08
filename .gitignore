@@ -1,0 +1,36 @@
+# Ansible secrets
+**/secrets.yml
+**/vault.yml
+.vault_pass
+*.retry
+
+# Inventory (may contain credentials)
+inventory/hosts.yml
+
+# WireGuard configs (contain private keys)
+*.conf
+!*.conf.j2
+team-configs/
+
+# SSH keys
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# OS / Editor
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Temp
+temp/
+*.tmp
+*.bak

@@ -1,0 +1,153 @@
+---
+# vLLM Gemma 4 NVFP4 on DGX Spark — 部署 Playbook
+#
+# 前置条件:
+#   - DGX Spark Docker 已配置 NVIDIA runtime（nvidia-ctk runtime configure）
+#   - vllm/vllm-openai:gemma4-cu130 镜像已在 DGX 上
+#   - 模型权重已在 vllm_model_local_dir
+#
+# 运行:
+#   # 仅启动容器（模型已下载、镜像已就位）
+#   ansible-playbook -i inventory/cloud playbooks/vllm/deploy.yml --tags start
+#
+#   # 完整部署（含 NVIDIA runtime 配置）
+#   ansible-playbook -i inventory/cloud playbooks/vllm/deploy.yml
+
+- name: 部署 vLLM Gemma 4 NVFP4 on DGX Spark
+  hosts: hackathon
+  become: false
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    # ================================================================
+    #  阶段 A: NVIDIA Container Runtime 配置
+    # ================================================================
+    - name: 配置 NVIDIA Container Runtime
+      tags: [runtime, full]
+      become: true
+      block:
+        - name: 检查 nvidia runtime 是否已配置
+          ansible.builtin.shell:
+            cmd: docker info 2>/dev/null | grep -q 'nvidia'
+          register: nvidia_runtime_check
+          changed_when: false
+          failed_when: false
+
+        - name: 配置 nvidia-ctk runtime
+          when: nvidia_runtime_check.rc != 0
+          ansible.builtin.shell:
+            cmd: nvidia-ctk runtime configure --runtime=docker
+          register: ctk_configure
+
+        - name: 重启 Docker（如果 runtime 刚配置）
+          when: nvidia_runtime_check.rc != 0
+          ansible.builtin.systemd:
+            daemon_reload: true
+            name: docker
+            state: restarted
+
+    # ================================================================
+    #  阶段 B: 检查模型和镜像
+    # ================================================================
+    - name: 检查前置条件
+      tags: [check, start, full]
+      block:
+        - name: 检查模型是否已下载
+          ansible.builtin.stat:
+            path: "{{ vllm_model_local_dir }}/config.json"
+          register: model_check
+
+        - name: 模型不存在时提示
+          when: not model_check.stat.exists
+          ansible.builtin.fail:
+            msg: >
+              模型未找到: {{ vllm_model_local_dir }}
+              请先手动下载模型（从 HuggingFace 或通过 rsync 传输）
+
+        - name: 检查 Docker 镜像是否存在
+          ansible.builtin.shell:
+            cmd: "docker images {{ vllm_image }} -q"
+          register: image_check
+          changed_when: false
+
+        - name: 镜像不存在时提示
+          when: image_check.stdout == ""
+          ansible.builtin.fail:
+            msg: >
+              镜像未找到: {{ vllm_image }}
+              请先通过 skopeo/rsync 传输镜像到 DGX
+
+    # ================================================================
+    #  阶段 C: 启动 vLLM 容器
+    # ================================================================
+    - name: 启动 vLLM 容器
+      tags: [start, full]
+      block:
+        - name: 停止已有 vLLM 容器
+          ansible.builtin.shell:
+            cmd: "docker rm -f {{ vllm_container_name }} 2>/dev/null || true"
+          changed_when: false
+
+        - name: 部署 docker-compose 文件
+          ansible.builtin.template:
+            src: templates/docker-compose.yml.j2
+            dest: "/home/{{ ansible_user }}/vllm-compose.yml"
+            mode: '0644'
+
+        - name: 启动 vLLM
+          ansible.builtin.shell:
+            cmd: docker compose -f /home/{{ ansible_user }}/vllm-compose.yml up -d
+          changed_when: true
+
+        - name: 等待 vLLM 启动（最多 5 分钟）
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ vllm_port }}/v1/models"
+            method: GET
+            status_code: 200
+            timeout: 10
+          register: vllm_health
+          retries: 30
+          delay: 10
+          failed_when: false
+
+        - name: 显示 vLLM 状态
+          ansible.builtin.debug:
+            msg: |
+              ════════════════════════════════════════════
+              vLLM Gemma 4 NVFP4 {{ '✓ 已就绪' if vllm_health.status | default(0) == 200 else '⏳ 启动中' }}
+              ════════════════════════════════════════════
+              API:  http://localhost:{{ vllm_port }}/v1
+              模型: {{ vllm_served_model_name }}
+              量化: NVFP4 (modelopt + marlin)
+              GPU:  {{ vllm_gpu_memory_utilization | float * 100 }}% 内存限制
+              CTX:  {{ vllm_max_model_len }} tokens
+              ════════════════════════════════════════════
+
+    # ================================================================
+    #  阶段 D: 验证推理
+    # ================================================================
+    - name: 验证推理
+      tags: [verify, full]
+      when: vllm_health.status | default(0) == 200
+      block:
+        - name: 发送测试请求
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ vllm_port }}/v1/chat/completions"
+            method: POST
+            headers:
+              Content-Type: application/json
+            body_format: json
+            body:
+              model: "{{ vllm_served_model_name }}"
+              messages:
+                - role: user
+                  content: "What is 12 * 17? Answer with just the number."
+              max_tokens: 20
+            timeout: 60
+          register: inference_test
+          failed_when: false
+
+        - name: 显示推理结果
+          ansible.builtin.debug:
+            msg: "推理{{ '成功' if inference_test.status | default(0) == 200 else '失败' }}: {{ inference_test.json.choices[0].message.content | default('N/A') }}"

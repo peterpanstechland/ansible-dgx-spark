@@ -1,0 +1,27 @@
+---
+# DGX Spark 主机清单示例
+# 复制此文件为 hosts.yml 并修改为你的实际配置
+#
+#   cp inventory/hosts.yml.example inventory/hosts.yml
+
+all:
+  children:
+    hackathon:
+      hosts:
+        dgx-spark:
+          # DGX Spark SSH 连接信息
+          ansible_host: <YOUR_DGX_IP>        # DGX 公网 IP 或 FRP 转发地址
+          ansible_user: <YOUR_USERNAME>       # DGX 登录用户名
+          ansible_port: 22                    # SSH 端口（如果用 FRP 转发，改为转发端口）
+          # 认证方式二选一：
+          # 方式 1: SSH 密钥（推荐）
+          ansible_ssh_private_key_file: ~/.ssh/id_rsa
+          # 方式 2: 密码（不推荐，建议使用 ansible-vault 加密）
+          # ansible_ssh_pass: "{{ vault_dgx_ssh_pass }}"
+          # ansible_become_pass: "{{ vault_dgx_become_pass }}"
+
+          # WireGuard VPN IP
+          wg_ip: 10.10.10.5
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3

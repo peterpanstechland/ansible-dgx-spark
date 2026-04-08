@@ -1,0 +1,36 @@
+---
+# Managed by Ansible — vLLM NVFP4 on DGX Spark
+services:
+  vllm:
+    container_name: {{ vllm_container_name }}
+    image: {{ vllm_image }}
+    runtime: nvidia
+    network_mode: host
+    restart: unless-stopped
+    shm_size: "16g"
+    environment:
+{% for key, value in vllm_env_vars.items() %}
+      {{ key }}: "{{ value }}"
+{% endfor %}
+    volumes:
+      - {{ vllm_model_local_dir }}:{{ vllm_model_container_path }}:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    command: >-
+      --model {{ vllm_model_container_path }}
+      --served-model-name {{ vllm_served_model_name }}
+      --port {{ vllm_port }}
+      --quantization {{ vllm_quantization }}
+      --gpu-memory-utilization {{ vllm_gpu_memory_utilization }}
+      --max-model-len {{ vllm_max_model_len }}
+{% if vllm_trust_remote_code %}
+      --trust-remote-code
+{% endif %}
+{% if vllm_enable_tool_choice | default(false) %}
+      --enable-auto-tool-choice
+      --tool-call-parser {{ vllm_tool_call_parser | default('hermes') }}
+{% endif %}

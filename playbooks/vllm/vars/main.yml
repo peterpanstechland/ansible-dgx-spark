@@ -1,0 +1,40 @@
+---
+# vLLM on DGX Spark 配置变量
+# 验证于 2026-04-05：Gemma 4 31B NVFP4 + Ollama 共存正常
+
+# ============================================
+# Docker 镜像（官方 gemma4 专用镜像，支持 arm64）
+# ============================================
+vllm_image: "vllm/vllm-openai:gemma4-cu130"
+
+# ============================================
+# 模型配置
+# ============================================
+vllm_served_model_name: "gemma-4-nvfp4"
+vllm_model_hf_repo: "nvidia/Gemma-4-31B-IT-NVFP4"
+vllm_model_local_dir: "/home/{{ ansible_user }}/models/Gemma-4-31B-IT-NVFP4"
+vllm_model_container_path: "/models/Gemma-4-31B-IT-NVFP4"
+vllm_quantization: "modelopt"
+vllm_trust_remote_code: true
+
+# ============================================
+# 资源控制（与 Ollama 共存时的保守设置）
+# ============================================
+vllm_gpu_memory_utilization: 0.40
+vllm_max_model_len: 32768
+
+# ============================================
+# 网络
+# ============================================
+vllm_port: 8888
+vllm_container_name: "vllm-nvfp4"
+
+# ============================================
+# 环境变量
+# ============================================
+vllm_enable_tool_choice: true
+vllm_tool_call_parser: "hermes"
+
+vllm_env_vars:
+  VLLM_LOGGING_LEVEL: "INFO"
+  VLLM_NVFP4_GEMM_BACKEND: "marlin"

@@ -1,0 +1,9 @@
+[Interface]
+Address = {{ wg_dgx_address }}
+PrivateKey = {{ wg_dgx_private_key }}
+
+[Peer]
+PublicKey = {{ wg_home_pubkey }}
+Endpoint = {{ wg_home_endpoint }}
+AllowedIPs = 10.10.10.1/32
+PersistentKeepalive = {{ wg_dgx_keepalive }}

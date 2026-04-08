@@ -1,0 +1,34 @@
+// Managed by Ansible — OpenShell proxy bootstrap for OpenClaw
+// Loaded via NODE_OPTIONS="--require /sandbox/.openclaw/proxy-bootstrap.js"
+const Module = require("module");
+const https = require("https");
+const http = require("http");
+
+// Explicit proxy removed — sandbox has direct internet via transparent routing.
+// Only set NO_PROXY fallback for safety.
+if (!process.env.NO_PROXY) process.env.NO_PROXY = "127.0.0.1,localhost,::1,host.openshell.internal";
+
+// openshell transparent proxy hangs on keep-alive POST->GET
+if (https.globalAgent) https.globalAgent.keepAlive = false;
+if (http.globalAgent)  http.globalAgent.keepAlive = false;
+
+// Disable axios built-in proxy (it sends plain HTTP instead of CONNECT tunnel)
+const origRequire = Module.prototype.require;
+Module.prototype.require = function patchedRequire(id) {
+  const result = origRequire.call(this, id);
+
+  if (id === "axios" || (typeof id === "string" && id.endsWith("/axios"))) {
+    const ax = result.default || result;
+    if (ax && ax.defaults && ax.defaults.proxy !== false) {
+      ax.defaults.proxy = false;
+    }
+  }
+
+  return result;
+};
+
+process.env.__OPENCLAW_PROXY_BOOTSTRAP = "1";
+
+if (process.env.NO_PROXY && !process.env.no_proxy?.includes("host.openshell.internal")) {
+  process.env.no_proxy = process.env.NO_PROXY;
+}

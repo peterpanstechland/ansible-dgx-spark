@@ -1,0 +1,414 @@
+---
+# NemoClaw 部署 Playbook — DGX Spark (黑客松)
+#
+# 前提条件:
+#   - DGX Spark 已在 inventory/cloud/hosts.yml 的 hackathon 组
+#   - OpenWrt 上 WireGuard Server 和 firewall.dgx 已配置
+#   - Ubuntu 上 registry mirror 容器已运行 (端口 5001/5002)
+#   - NPM 已配置 nemoclaw.peafamily.online 代理规则
+#
+# 运行方式:
+#   # 首次完整部署（包含 WireGuard + NemoClaw onboard）
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/deploy.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     -e wg_dgx_private_key=xxx
+#
+#   # 仅重新部署 NemoClaw（跳过 WireGuard）
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/deploy.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     --tags nemoclaw
+#
+#   # 仅修复（清理 + 重新 onboard）
+#   ansible-playbook -i inventory/cloud playbooks/nemoclaw/deploy.yml \
+#     -e nvidia_api_key=nvapi-xxx \
+#     --tags repair
+
+- name: 部署 NemoClaw on DGX Spark
+  hosts: hackathon
+  become: true
+  vars_files:
+    - vars/main.yml
+
+  pre_tasks:
+    - name: 验证 NVIDIA API Key 已提供
+      ansible.builtin.assert:
+        that:
+          - nvidia_api_key | length > 0
+        fail_msg: "请通过 -e nvidia_api_key=nvapi-xxx 传入 NVIDIA API Key"
+      tags: always
+
+    - name: 检测系统架构
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture == "aarch64"
+        fail_msg: "此 playbook 针对 DGX Spark (aarch64) 设计"
+      tags: always
+
+  tasks:
+    # ================================================================
+    #  第一阶段: WireGuard VPN
+    # ================================================================
+    - name: WireGuard 配置
+      tags: [wireguard, full]
+      block:
+        - name: 安装 WireGuard
+          ansible.builtin.apt:
+            name: wireguard
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: 检查 WireGuard 私钥是否已提供或已存在
+          ansible.builtin.stat:
+            path: /etc/wireguard/wg0.conf
+          register: wg_conf_stat
+
+        - name: 生成 WireGuard 密钥对（首次部署）
+          when: not wg_conf_stat.stat.exists and (wg_dgx_private_key is not defined or wg_dgx_private_key | length == 0)
+          block:
+            - name: 生成私钥
+              ansible.builtin.command: wg genkey
+              register: wg_genkey
+              changed_when: true
+
+            - name: 设置私钥变量
+              ansible.builtin.set_fact:
+                wg_dgx_private_key: "{{ wg_genkey.stdout }}"
+
+            - name: 导出公钥
+              ansible.builtin.shell:
+                cmd: "echo '{{ wg_dgx_private_key }}' | wg pubkey"
+              register: wg_pubkey
+              changed_when: false
+
+            - name: 显示公钥（需添加到 OpenWrt WireGuard Peer）
+              ansible.builtin.debug:
+                msg: |
+                  ══════════════════════════════════════════════
+                  DGX Spark WireGuard 公钥:
+                  {{ wg_pubkey.stdout }}
+
+                  请在 OpenWrt 上添加此公钥为 Peer:
+                    uci set network.wg_dgx=wireguard_wg0
+                    uci set network.wg_dgx.description='DGX-Spark-Hackathon'
+                    uci set network.wg_dgx.public_key='{{ wg_pubkey.stdout }}'
+                    uci add_list network.wg_dgx.allowed_ips='10.10.10.5/32'
+                    uci commit network
+                    /etc/init.d/network restart
+                  ══════════════════════════════════════════════
+
+        - name: 部署 WireGuard 配置
+          ansible.builtin.template:
+            src: templates/wg0.conf.j2
+            dest: /etc/wireguard/wg0.conf
+            mode: '0600'
+            owner: root
+            group: root
+          when: wg_dgx_private_key is defined and wg_dgx_private_key | length > 0
+          notify: 重启 WireGuard
+
+        - name: 启用 WireGuard 服务
+          ansible.builtin.systemd:
+            name: "wg-quick@{{ wg_interface }}"
+            state: started
+            enabled: true
+
+        - name: 部署 DNAT 规则脚本
+          ansible.builtin.template:
+            src: templates/50-wg-dnat.sh.j2
+            dest: /etc/networkd-dispatcher/routable.d/50-wg-dnat.sh
+            mode: '0755'
+            owner: root
+            group: root
+          notify: 执行 DNAT 规则
+
+        - name: 验证 WireGuard 连通性
+          ansible.builtin.command:
+            cmd: ping -c 2 -W 5 10.10.10.1
+          register: wg_ping
+          changed_when: false
+          failed_when: wg_ping.rc != 0
+          retries: 3
+          delay: 5
+
+    # ================================================================
+    #  第二阶段: Docker + Registry Mirror
+    # ================================================================
+    - name: Docker 配置
+      tags: [docker, full]
+      block:
+        - name: 检查 Docker 是否已安装
+          ansible.builtin.command: docker --version
+          register: docker_check
+          changed_when: false
+          failed_when: false
+
+        - name: 安装 Docker（如果未安装）
+          when: docker_check.rc != 0
+          block:
+            - name: 安装 Docker 依赖
+              ansible.builtin.apt:
+                name:
+                  - ca-certificates
+                  - curl
+                  - gnupg
+                state: present
+                update_cache: true
+
+            - name: 添加 Docker GPG key
+              ansible.builtin.apt_key:
+                url: https://download.docker.com/linux/ubuntu/gpg
+                state: present
+
+            - name: 添加 Docker APT 仓库
+              ansible.builtin.apt_repository:
+                repo: "deb [arch=arm64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+                state: present
+                filename: docker
+
+            - name: 安装 Docker
+              ansible.builtin.apt:
+                name:
+                  - docker-ce
+                  - docker-ce-cli
+                  - containerd.io
+                  - docker-compose-plugin
+                state: present
+
+            - name: 启动 Docker
+              ansible.builtin.systemd:
+                name: docker
+                state: started
+                enabled: true
+
+            - name: 将用户加入 docker 组
+              ansible.builtin.user:
+                name: "{{ ansible_user }}"
+                groups: docker
+                append: true
+
+        - name: 配置 Docker registry mirror（GFW 绕行）
+          ansible.builtin.template:
+            src: templates/docker-daemon.json.j2
+            dest: /etc/docker/daemon.json
+            mode: '0644'
+          notify: 重启 Docker
+
+    # ================================================================
+    #  第三阶段: Node.js + NemoClaw CLI
+    # ================================================================
+    - name: Node.js 和 NemoClaw 安装
+      tags: [nemoclaw, full]
+      become: false
+      block:
+        - name: 检查 nvm 是否已安装
+          ansible.builtin.stat:
+            path: "{{ ansible_env.HOME }}/.nvm/nvm.sh"
+          register: nvm_stat
+
+        - name: 安装 nvm
+          when: not nvm_stat.stat.exists
+          ansible.builtin.shell:
+            cmd: >
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+          args:
+            creates: "{{ ansible_env.HOME }}/.nvm/nvm.sh"
+
+        - name: 安装 Node.js
+          ansible.builtin.shell:
+            cmd: >
+              source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+              nvm install {{ node_version }} &&
+              nvm alias default {{ node_version }}
+          args:
+            executable: /bin/bash
+            creates: "{{ ansible_env.HOME }}/.nvm/versions/node/v{{ node_version }}.*"
+          register: node_install
+          changed_when: "'is already installed' not in node_install.stderr"
+          failed_when: false
+
+        - name: 检查 NemoClaw CLI
+          ansible.builtin.shell:
+            cmd: "source {{ ansible_env.HOME }}/.nvm/nvm.sh && nemoclaw --version"
+          args:
+            executable: /bin/bash
+          register: nemoclaw_check
+          changed_when: false
+          failed_when: false
+
+        - name: 安装 NemoClaw CLI
+          when: nemoclaw_check.rc != 0
+          ansible.builtin.shell:
+            cmd: "source {{ ansible_env.HOME }}/.nvm/nvm.sh && npm install -g nemoclaw"
+          args:
+            executable: /bin/bash
+          register: nemoclaw_install
+          changed_when: "'added' in nemoclaw_install.stdout"
+
+        - name: 检查 OpenShell CLI
+          ansible.builtin.shell:
+            cmd: "source {{ ansible_env.HOME }}/.nvm/nvm.sh && openshell --version"
+          args:
+            executable: /bin/bash
+          register: openshell_check
+          changed_when: false
+          failed_when: false
+
+        - name: 安装 OpenShell CLI
+          when: openshell_check.rc != 0
+          ansible.builtin.shell:
+            cmd: "source {{ ansible_env.HOME }}/.nvm/nvm.sh && npm install -g @anthropic-ai/openshell"
+          args:
+            executable: /bin/bash
+          register: openshell_install
+          changed_when: "'added' in openshell_install.stdout"
+
+    # ================================================================
+    #  第四阶段: NemoClaw Onboard
+    # ================================================================
+    - name: NemoClaw 沙箱部署
+      tags: [nemoclaw, repair, full]
+      become: false
+      block:
+        - name: 检查现有沙箱状态
+          ansible.builtin.shell:
+            cmd: >
+              source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+              nemoclaw {{ nemoclaw_sandbox_name }} status 2>&1
+          args:
+            executable: /bin/bash
+          register: sandbox_status
+          changed_when: false
+          failed_when: false
+
+        - name: 检查 UI 是否可达
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ nemoclaw_ui_port }}/"
+            method: GET
+            status_code: 200
+            timeout: 10
+          register: ui_health
+          failed_when: false
+
+        - name: 清理不健康的沙箱
+          when: >
+            (sandbox_status.rc == 0 and 'Phase' in sandbox_status.stdout) and
+            (ui_health.status is not defined or ui_health.status != 200)
+          ansible.builtin.shell:
+            cmd: >
+              source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+              openshell forward stop {{ nemoclaw_ui_port }} 2>/dev/null;
+              openshell sandbox delete {{ nemoclaw_sandbox_name }} 2>&1
+          args:
+            executable: /bin/bash
+          register: sandbox_cleanup
+          changed_when: "'Deleted' in sandbox_cleanup.stdout"
+
+        - name: 执行 NemoClaw onboard
+          when: ui_health.status is not defined or ui_health.status != 200
+          ansible.builtin.shell:
+            cmd: >
+              source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+              export NVIDIA_API_KEY='{{ nvidia_api_key }}' &&
+              export NEMOCLAW_PROVIDER={{ nemoclaw_provider }} &&
+              export NEMOCLAW_SANDBOX_NAME={{ nemoclaw_sandbox_name }} &&
+              export CHAT_UI_URL={{ nemoclaw_chat_ui_url }} &&
+              nemoclaw onboard --non-interactive 2>&1
+          args:
+            executable: /bin/bash
+          register: onboard_result
+          changed_when: "'OpenClaw gateway launched inside sandbox' in onboard_result.stdout"
+          timeout: 300
+
+        - name: 显示 onboard 结果
+          ansible.builtin.debug:
+            msg: "{{ onboard_result.stdout_lines | default(['沙箱已在运行，跳过 onboard']) }}"
+          when: onboard_result.stdout_lines is defined
+
+        - name: 提取 token URL
+          when: onboard_result.stdout is defined and 'token=' in onboard_result.stdout
+          ansible.builtin.set_fact:
+            nemoclaw_token_url: "{{ onboard_result.stdout | regex_search('https://nemoclaw\\.peafamily\\.online/#token=[a-f0-9]+') }}"
+
+        - name: 等待 sandbox 就绪（Phase=Ready/Running）
+          ansible.builtin.shell:
+            cmd: >
+              source {{ ansible_env.HOME }}/.nvm/nvm.sh &&
+              openshell sandbox get {{ nemoclaw_sandbox_name }}
+              --gateway {{ openshell_gateway_name }} 2>&1 | grep -qE 'Ready|Running'
+          args:
+            executable: /bin/bash
+          register: sandbox_ready
+          retries: 12
+          delay: 10
+          until: sandbox_ready.rc == 0
+
+    # ================================================================
+    #  第五阶段: 验证
+    # ================================================================
+    - name: 端到端验证
+      tags: [verify, nemoclaw, repair, full]
+      block:
+        - name: 验证 DGX localhost 访问
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ nemoclaw_ui_port }}/"
+            method: GET
+            status_code: 200
+            timeout: 15
+          register: local_check
+          retries: 5
+          delay: 10
+
+        - name: 验证 WireGuard 访问（从 DGX 回 home）
+          ansible.builtin.command:
+            cmd: "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 http://10.10.10.1:{{ registry_ghcr_port }}/"
+          register: wg_check
+          changed_when: false
+          failed_when: false
+
+    # ================================================================
+    #  显示部署结果
+    # ================================================================
+    - name: 显示部署结果
+      tags: always
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          NemoClaw 部署完成!
+          ═══════════════════════════════════════════════════════
+
+          沙箱名称:   {{ nemoclaw_sandbox_name }}
+          模型:       {{ nemoclaw_model }}
+          提供商:     NVIDIA Endpoints ({{ nemoclaw_provider }})
+
+          访问地址:
+            本地:   http://127.0.0.1:{{ nemoclaw_ui_port }}/
+            域名:   {{ nemoclaw_chat_ui_url }}/
+            Token:  {{ nemoclaw_token_url | default('(使用 nemoclaw my-assistant status 查看)') }}
+
+          WireGuard:  {{ dgx_wg_ip }} ↔ 10.10.10.1
+
+          运维命令 (SSH 到 DGX 后执行):
+            状态:    nemoclaw {{ nemoclaw_sandbox_name }} status
+            日志:    nemoclaw {{ nemoclaw_sandbox_name }} logs --follow
+            修复:    ansible-playbook ... --tags repair -e nvidia_api_key=xxx
+
+          文档:      docs/nemoclaw-dgx-spark.md
+          ═══════════════════════════════════════════════════════
+
+  handlers:
+    - name: 重启 WireGuard
+      ansible.builtin.systemd:
+        name: "wg-quick@{{ wg_interface }}"
+        state: restarted
+
+    - name: 执行 DNAT 规则
+      ansible.builtin.command:
+        cmd: /etc/networkd-dispatcher/routable.d/50-wg-dnat.sh
+      environment:
+        IFACE: "{{ wg_interface }}"
+
+    - name: 重启 Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted

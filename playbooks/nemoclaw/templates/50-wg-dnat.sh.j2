@@ -1,0 +1,9 @@
+#!/bin/sh
+# Managed by Ansible — WireGuard DNAT rules for DGX Spark
+if [ "$IFACE" = "{{ wg_interface }}" ]; then
+    sysctl -w net.ipv4.conf.{{ wg_interface }}.route_localnet=1
+{% for rule in dgx_dnat_ports %}
+    iptables -t nat -C PREROUTING -i {{ wg_interface }} -p tcp --dport {{ rule.port }} -j DNAT --to-destination {{ rule.dest }} 2>/dev/null || \
+        iptables -t nat -A PREROUTING -i {{ wg_interface }} -p tcp --dport {{ rule.port }} -j DNAT --to-destination {{ rule.dest }}
+{% endfor %}
+fi

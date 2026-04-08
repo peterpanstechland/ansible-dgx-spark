@@ -1,0 +1,18 @@
+#!/bin/sh
+# Managed by Ansible — node wrapper for OpenClaw environment injection
+export NODE_EXTRA_CA_CERTS={{ sandbox_ca_cert_path }}
+if [ -z "$__OPENCLAW_NODE_WRAPPED" ]; then
+  export __OPENCLAW_NODE_WRAPPED=1
+  unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+  export NO_PROXY=127.0.0.1,localhost,::1,host.openshell.internal,host.docker.internal,10.42.0.0/16,10.43.0.0/16,{{ docker_bridge_gateway }}
+  export no_proxy="$NO_PROXY"
+  export NODE_OPTIONS="--require /sandbox/.openclaw/proxy-bootstrap.js ${NODE_OPTIONS:-}"
+{% if nemoclaw_amap_api_key | default('') | length > 0 %}
+  export AMAP_API_KEY={{ nemoclaw_amap_api_key }}
+{% endif %}
+{% if nemoclaw_travel_app.enabled | default(false) | bool %}
+  export TRAVEL_APP_URL=http://{{ docker_bridge_gateway }}:{{ nemoclaw_travel_app.port }}
+  export TRAVEL_APP_PUBLIC_URL={{ nemoclaw_travel_app.public_url }}
+{% endif %}
+fi
+exec {{ sandbox_node_real_path }} "$@"

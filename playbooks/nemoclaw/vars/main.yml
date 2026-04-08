@@ -1,0 +1,156 @@
+---
+# NemoClaw on DGX Spark 配置变量
+# 请根据您的环境修改以下变量
+
+# ============================================
+# DGX Spark 连接信息
+# ============================================
+dgx_wg_ip: 10.10.10.5
+dgx_ssh_host: "{{ ansible_host }}"
+dgx_ssh_port: "{{ ansible_port }}"
+dgx_ssh_user: "{{ ansible_user }}"
+
+# ============================================
+# WireGuard
+# ============================================
+wg_interface: wg0
+wg_dgx_address: "10.10.10.5/24"
+# 替换为你的 WireGuard Server 的公网地址和端口
+wg_home_endpoint: "your-domain.example.com:51820"
+# 替换为你的 WireGuard Server 的公钥
+wg_home_pubkey: "<YOUR_WG_SERVER_PUBLIC_KEY>"
+wg_dgx_keepalive: 25
+
+# ============================================
+# NemoClaw / OpenShell
+# ============================================
+nemoclaw_sandbox_name: my-assistant
+nemoclaw_provider: build
+nemoclaw_model: "nvidia/nemotron-3-super-120b-a12b"
+nemoclaw_ui_port: 18789
+# 替换为你的 NemoClaw 访问域名
+nemoclaw_chat_ui_url: "https://nemoclaw.your-domain.com"
+nemoclaw_policy_presets:
+  - pypi
+  - npm
+
+openshell_cluster_container: "openshell-cluster-nemoclaw"
+openshell_gateway_name: "nemoclaw"
+
+kubectl_exec_prefix: >-
+  docker exec {{ openshell_cluster_container }}
+  kubectl exec -n openshell {{ nemoclaw_sandbox_name }} --
+
+sandbox_ssh_prefix: >-
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o 'ProxyCommand=openshell ssh-proxy --gateway-name {{ openshell_gateway_name }} --name {{ nemoclaw_sandbox_name }}'
+  sandbox@openshell-{{ nemoclaw_sandbox_name }}
+
+# NVIDIA API Key（通过 --extra-vars 或环境变量传入，不存代码）
+nvidia_api_key: "{{ lookup('env', 'NVIDIA_API_KEY') }}"
+
+# ============================================
+# Ollama
+# ============================================
+ollama_host: "0.0.0.0:11434"
+ollama_keep_alive: "-1"
+ollama_base_model: "gpt-oss:120b"
+ollama_fast_model: "gpt-oss:120b-fast"
+ollama_num_ctx: 32768
+ollama_provider_name: "local-ollama"
+
+# ============================================
+# OpenClaw Gateway 配置
+# ============================================
+gateway_allowed_origins:
+  - "http://127.0.0.1:{{ nemoclaw_ui_port }}"
+  - "{{ nemoclaw_chat_ui_url }}"
+gateway_trusted_proxies:
+  - "127.0.0.1"
+  - "::1"
+  - "10.42.0.0/16"
+  - "172.18.0.0/16"
+# onboard 后由 NemoClaw 自动生成，无需手动设置
+nemoclaw_gateway_token: "<AUTO_GENERATED_BY_NEMOCLAW_ONBOARD>"
+
+# ============================================
+# 飞书集成（可选，通过 -e feishu_enabled=true 启用）
+# ============================================
+feishu_enabled: false
+feishu_app_id: ""
+feishu_app_secret: ""
+
+# ============================================
+# Watchdog
+# ============================================
+watchdog_script_path: "/home/{{ ansible_user }}/nemoclaw-watchdog.sh"
+watchdog_log_path: "/home/{{ ansible_user }}/nemoclaw-watchdog.log"
+watchdog_container_ip: "172.18.0.2"
+watchdog_nodeport: 30089
+
+# ============================================
+# vLLM（与 Ollama 共存）
+# ============================================
+vllm_port: 8888
+vllm_served_model_name: "gemma-4-nvfp4"
+vllm_context_window: 32768
+vllm_max_tokens: 1024
+
+# ============================================
+# A2A Local LLM Agent（本地模型 A2A 网关）
+# ============================================
+a2a_local_llm_port: 18071
+a2a_local_llm_container: "a2a-local-llm"
+
+# ============================================
+# Travel App（旅行助手 云希）
+# ============================================
+nemoclaw_travel_app:
+  enabled: true
+  port: 18098
+  container_name: "nemoclaw-travel-app"
+  public_url: "http://{{ dgx_wg_ip }}:18098"
+
+# 高德地图 API Key（通过环境变量传入）
+nemoclaw_amap_api_key: "{{ lookup('env', 'AMAP_API_KEY') }}"
+
+# ============================================
+# Docker 桥接网关（sandbox → host 通信）
+# ============================================
+docker_bridge_gateway: "172.18.0.1"
+
+# ============================================
+# Docker Registry Mirror
+# ============================================
+registry_mirror_host: "10.10.10.1"
+registry_ghcr_port: 5001
+registry_dockerhub_port: 5002
+
+# ============================================
+# DNAT 规则（DGX 端 WireGuard → localhost）
+# ============================================
+dgx_dnat_ports:
+  - { port: 11434, dest: "127.0.0.1:11434", comment: "Ollama" }
+  - { port: 18789, dest: "127.0.0.1:18789", comment: "NemoClaw UI" }
+
+# ============================================
+# Nginx Proxy Manager（Home 端）
+# ============================================
+# 替换为你的代理域名
+npm_proxy_domain: "nemoclaw.your-domain.com"
+npm_proxy_target: "{{ dgx_wg_ip }}:{{ nemoclaw_ui_port }}"
+# 替换为你的 Home 服务器 IP
+npm_home_server_ip: "<YOUR_HOME_SERVER_IP>"
+
+# ============================================
+# Node.js（NemoClaw 依赖）
+# ============================================
+node_version: "22"
+nvm_dir: "$HOME/.nvm"
+
+# ============================================
+# Sandbox 内部路径（由 OpenShell 容器镜像决定）
+# ============================================
+sandbox_node_binary: "/usr/local/bin/node"
+sandbox_node_real_path: "/usr/local/bin/node.real"
+sandbox_ca_cert_path: "/etc/openshell-tls/openshell-ca.pem"

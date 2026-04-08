@@ -1,0 +1,7 @@
+# Managed by Ansible — NPM streaming optimization for NemoClaw
+proxy_buffering off;
+proxy_cache off;
+proxy_request_buffering off;
+add_header X-Accel-Buffering no;
+proxy_buffer_size 16k;
+proxy_buffers 4 16k;
