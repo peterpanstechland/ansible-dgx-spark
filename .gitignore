@@ -34,3 +34,6 @@ logs/
 temp/
 *.tmp
 *.bak
+
+# Local Node dependencies, including temporary symlinks
+node_modules
